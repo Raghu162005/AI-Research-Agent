@@ -8,7 +8,13 @@ import os
 os.environ.setdefault("GROQ_API_KEY", "test-key")
 os.environ.setdefault("TAVILY_API_KEY", "test-key")
 
-from app.llm import LLMClient, _is_retryable, _retry_delay, parse_json
+from app.llm import (
+    LLMClient,
+    _is_json_validation_error,
+    _is_retryable,
+    _retry_delay,
+    parse_json,
+)
 
 
 class FakeRateLimit(Exception):
@@ -26,6 +32,20 @@ class FakeBadRequest(Exception):
 
     def __str__(self) -> str:
         return "Error code: 400 - invalid model"
+
+
+class FakeJsonValidation(Exception):
+    """Groq's validator rejecting generation. Real one shipped valid JSON."""
+
+    status_code = 400
+
+    def __str__(self) -> str:
+        return (
+            "Error code: 400 - {'error': {'message': "
+            '"Failed to generate JSON. Please adjust your prompt.", '
+            "'type': 'invalid_request_error', 'code': 'json_validate_failed', "
+            "'failed_generation': '{\"executive_summary\":\"fine\",\"sections\":[]}'}}"
+        )
 
 
 class FakeServerError(Exception):
@@ -73,14 +93,14 @@ def scripted_client(failures, success="ok"):
 def main() -> None:
     passed = failed = 0
 
-    def check(label: str, condition: bool) -> None:
+    def check(label: str, condition: bool, detail: str = "") -> None:
         nonlocal passed, failed
         if condition:
             passed += 1
             print(f"PASS {label}")
         else:
             failed += 1
-            print(f"FAIL {label}")
+            print(f"FAIL {label}{(' -> ' + detail) if detail else ''}")
 
     print("=== retry classification ===")
     check("429 retryable", _is_retryable(FakeRateLimit()))
@@ -126,12 +146,137 @@ def main() -> None:
     check("fenced object", parse_json('```json\n{"a": 2}\n```') == {"a": 2})
     check("prose wrapped", parse_json('Sure! {"a": 3} hope that helps') == {"a": 3})
     check("array", parse_json("[1, 2]") == [1, 2])
+    check("trailing comma repaired", parse_json('{"a": 4,}') == {"a": 4})
+    check("trailing comma in array", parse_json("[1, 2,]") == [1, 2])
+    check("fence with prose", parse_json('text\n```json\n{"a": 5}\n```\nmore') == {"a": 5})
     failed_parse = False
     try:
         parse_json("no json at all")
     except Exception:
         failed_parse = True
     check("rejects garbage", failed_parse)
+    failed_parse2 = False
+    try:
+        parse_json('{"a": 1')
+    except Exception:
+        failed_parse2 = True
+    check("rejects truncated", failed_parse2)
+
+    print("\n=== attempt accounting ===")
+    client, completions = scripted_client([FakeJsonValidation()])
+    raised = ""
+    try:
+        client.complete("sys", "user", json_mode=True)
+    except Exception as exc:
+        raised = str(exc)
+    check("json validation error not treated as retryable", not _is_retryable(FakeJsonValidation()))
+    check("json validation error detected", _is_json_validation_error(FakeJsonValidation()))
+    check("400 model error is not a json validation error", not _is_json_validation_error(FakeBadRequest()))
+    check(
+        f"reports ACTUAL attempts, not the maximum (calls={completions.calls})",
+        "after 1 attempt(s)" in raised,
+        raised[:90],
+    )
+
+    print("\n=== json validator fallback ===")
+
+    class RejectThenSucceed:
+        """Fails strict JSON mode, returns valid JSON without response_format."""
+
+        def __init__(self):
+            self.calls = 0
+            self.modes = []
+
+        def create(self, **kwargs):
+            self.calls += 1
+            strict = kwargs.get("response_format") is not None
+            self.modes.append("strict" if strict else "fallback")
+            if strict:
+                raise FakeJsonValidation()
+            return FakeResponse(
+                'Here is the JSON you asked for:\n```json\n'
+                '{"executive_summary":"recovered","sections":[{"title":"a","markdown":"b"}]}\n```'
+            )
+
+    client = LLMClient()
+    scripted = RejectThenSucceed()
+    client._client = type(
+        "FakeGroq", (), {"chat": type("Chat", (), {"completions": scripted})()}
+    )()
+    data = client.complete_json("sys", "user")
+    check("falls back when provider validator rejects", data["executive_summary"] == "recovered")
+    check("fallback parsed fenced json inside prose", len(data["sections"]) == 1)
+    check("strict attempted first, then fallback", scripted.modes == ["strict", "fallback"], str(scripted.modes))
+
+    class AlwaysInvalid:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            return FakeResponse("I refuse to produce JSON, sorry about that.")
+
+    client = LLMClient()
+    always = AlwaysInvalid()
+    client._client = type(
+        "FakeGroq", (), {"chat": type("Chat", (), {"completions": always})()}
+    )()
+    gave_up = False
+    gave_up_msg = ""
+    try:
+        client.complete_json("sys", "user")
+    except Exception as exc:
+        gave_up = True
+        gave_up_msg = str(exc)
+    check(
+        "falls back when strict mode returns prose",
+        always.calls == 2,
+        f"calls={always.calls}",
+    )
+    check("gives up after fallback also fails", gave_up)
+    check("error names both attempts", "Strict mode failed" in gave_up_msg and "Fallback failed" in gave_up_msg, gave_up_msg[:120])
+
+    class ProseThenJson:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResponse("Sure, here is your report as prose, not JSON.")
+            return FakeResponse('{"executive_summary":"recovered on fallback"}')
+
+    client = LLMClient()
+    prose = ProseThenJson()
+    client._client = type(
+        "FakeGroq", (), {"chat": type("Chat", (), {"completions": prose})()}
+    )()
+    recovered = client.complete_json("sys", "user")
+    check(
+        "recovers from prose-only strict response",
+        recovered["executive_summary"] == "recovered on fallback" and prose.calls == 2,
+        f"calls={prose.calls}",
+    )
+
+    class PlainBadRequest:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            raise FakeBadRequest()
+
+    client = LLMClient()
+    bad = PlainBadRequest()
+    client._client = type(
+        "FakeGroq", (), {"chat": type("Chat", (), {"completions": bad})()}
+    )()
+    raised_plain = False
+    try:
+        client.complete_json("sys", "user")
+    except Exception:
+        raised_plain = True
+    check("non-json 400 does not trigger fallback", bad.calls == 1 and raised_plain, f"calls={bad.calls}")
 
     print(f"\n{passed} passed, {failed} failed")
     if failed:

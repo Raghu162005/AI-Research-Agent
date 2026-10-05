@@ -24,10 +24,19 @@ _RETRYABLE_MARKERS = (
     "timed out",
     "connection",
 )
+_JSON_VALIDATION_MARKERS = (
+    "json_validate_failed",
+    "failed to generate json",
+    "invalid json",
+)
 
 
 class LLMError(RuntimeError):
     pass
+
+
+class LLMJSONError(LLMError):
+    """The model responded, but the response was not usable JSON."""
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -40,6 +49,17 @@ def _is_retryable(exc: Exception) -> bool:
     return any(marker in message for marker in _RETRYABLE_MARKERS)
 
 
+def _is_json_validation_error(exc: Exception) -> bool:
+    """True when the provider's own JSON validator rejected the generation.
+
+    Groq sometimes returns ``json_validate_failed`` for output that is in fact
+    valid JSON, so this is recovered by parsing the text ourselves rather than
+    by retrying the same request.
+    """
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in message for marker in _JSON_VALIDATION_MARKERS)
+
+
 def _retry_delay(exc: Exception, attempt: int, base: float, maximum: float) -> float:
     hint = _RETRY_AFTER_PATTERN.search(str(exc))
     if hint:
@@ -48,21 +68,36 @@ def _retry_delay(exc: Exception, attempt: int, base: float, maximum: float) -> f
     return min(exponential + random.uniform(0, 0.75), maximum)
 
 
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
 def parse_json(raw: str) -> Any:
     text = _JSON_FENCE.sub(r"\1", raw.strip()).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    for candidate in (text, *_json_candidates(text)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            repaired = _TRAILING_COMMA.sub(r"\1", candidate)
+            if repaired != candidate:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
 
-    starts = [pos for pos in (text.find("{"), text.find("[")) if pos != -1]
-    end = max(text.rfind("}"), text.rfind("]"))
-    if not starts or end == -1:
-        raise LLMError(f"Model output was not valid JSON: {raw[:300]}")
-    try:
-        return json.loads(text[min(starts) : end + 1])
-    except json.JSONDecodeError as exc:
-        raise LLMError(f"Model output was not valid JSON: {raw[:300]}") from exc
+    raise LLMJSONError(
+        "Model output was not valid JSON. It began: " + repr(raw[:200])
+    )
+
+
+def _json_candidates(text: str) -> list[str]:
+    """Progressively looser slices of a response that may be wrapped in prose."""
+    candidates: list[str] = []
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end > start:
+            candidates.append(text[start : end + 1])
+    return candidates
 
 
 class LLMClient:
@@ -105,32 +140,61 @@ class LLMClient:
         return content.strip()
 
     def _request_with_retry(self, payload: dict[str, Any]) -> str:
-        attempts = self.max_retries + 1
+        max_attempts = self.max_retries + 1
         last_error: Exception | None = None
+        made = 0
 
-        for attempt in range(attempts):
+        for attempt in range(max_attempts):
+            made = attempt + 1
             try:
                 response = self._client.chat.completions.create(**payload)
                 return response.choices[0].message.content
             except Exception as exc:
                 last_error = exc
-                if attempt == attempts - 1 or not _is_retryable(exc):
+                if attempt == max_attempts - 1 or not _is_retryable(exc):
                     break
                 delay = _retry_delay(
                     exc, attempt, self._retry_base_delay, self._retry_max_delay
                 )
                 logger.warning(
                     "LLM call failed (attempt %s/%s), retrying in %.1fs: %s",
-                    attempt + 1,
-                    attempts,
+                    made,
+                    max_attempts,
                     delay,
                     exc,
                 )
                 time.sleep(delay)
 
         raise LLMError(
-            f"Groq request failed after {attempts} attempt(s): {last_error}"
+            f"Groq request failed after {made} attempt(s): {last_error}"
         ) from last_error
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> Any:
-        return parse_json(self.complete(system_prompt, user_prompt, json_mode=True))
+        strict_error: Exception | None = None
+        try:
+            return parse_json(
+                self.complete(system_prompt, user_prompt, json_mode=True)
+            )
+        except LLMError as exc:
+            if not isinstance(exc, LLMJSONError) and not _is_json_validation_error(exc):
+                raise
+            strict_error = exc
+
+        logger.warning(
+            "Strict JSON mode produced no usable output (%s); "
+            "retrying without response_format",
+            type(strict_error).__name__,
+        )
+        fallback_prompt = (
+            f"{user_prompt}\n\n"
+            "Reply with a single valid JSON object and nothing else: "
+            "no prose, no explanation, no markdown code fences."
+        )
+        try:
+            return parse_json(self.complete(system_prompt, fallback_prompt))
+        except LLMError as exc:
+            raise LLMError(
+                f"Model did not return usable JSON. Strict mode failed with "
+                f"{type(strict_error).__name__}: {strict_error}. "
+                f"Fallback failed with {type(exc).__name__}: {exc}"
+            ) from exc

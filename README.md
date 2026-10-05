@@ -218,12 +218,12 @@ curl -N http://localhost:8000/research/3698dcb58da6/events
 
 ## Tests
 
-137 assertions across three suites. No API keys and no network access required — the LLM
+153 assertions across three suites. No API keys and no network access required — the LLM
 and search layers are injected as fakes.
 
 ```bash
 cd backend
-python tests/test_llm.py      # 16  retry/backoff + JSON parsing
+python tests/test_llm.py      # 32  retry/backoff, attempt accounting, JSON fallback
 python tests/test_agent.py    # 72  pipeline, citations, dedup, store recovery
 python tests/test_api.py      # 49  API, SSE, downloads, restart recovery
 ```
@@ -289,6 +289,21 @@ assembler never rendered it, so the most useful part of each report was silently
 
 **9. N+1 query on the history endpoint.** `/reports` fetched up to 50 full rows including
 every report body, then issued a second query per row. Replaced with a summary projection.
+
+**10. Groq's JSON validator rejected valid JSON.** A real run failed with
+`json_validate_failed`, and the `failed_generation` in the error was, on inspection,
+completely well-formed — properly escaped, correctly closed. The provider's validator was
+the thing failing, not the model, and there was no way around it. `complete_json` now
+falls back to generating without `response_format` and parses the text itself, using
+lenient extraction that handles prose-wrapped and fenced JSON and repairs trailing commas.
+The same fallback covers the case where strict mode succeeds but returns unparseable
+prose. The run that previously failed now completes, with the fallback visible in the logs.
+
+**11. An error message reported the wrong number of attempts.** Failures always claimed
+`after 6 attempt(s)` — the configured maximum — even when a non-retryable `400` had failed
+on the very first call. This actively misled debugging: it suggested six attempts and a
+long backoff had occurred when exactly one request had been made, which is why the failure
+appeared instantly. The count is now the number of attempts genuinely made.
 
 ---
 
