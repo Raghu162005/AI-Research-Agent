@@ -10,6 +10,7 @@ os.environ.setdefault("TAVILY_API_KEY", "test-key")
 
 from app.llm import (
     LLMClient,
+    _is_daily_quota_error,
     _is_json_validation_error,
     _is_retryable,
     _retry_delay,
@@ -53,6 +54,20 @@ class FakeServerError(Exception):
 
     def __str__(self) -> str:
         return "service unavailable"
+
+
+class FakeDailyQuota(Exception):
+    """Tokens-per-day exhaustion. Retrying is pointless, unlike a 429 TPM."""
+
+    status_code = 429
+
+    def __str__(self) -> str:
+        return (
+            "Error code: 429 - {'error': {'message': 'Rate limit reached for model "
+            "`openai/gpt-oss-120b` on tokens per day (TPD): Limit 200000, "
+            "Used 196481, Requested 5670. Please try again in 15m29.232s.', "
+            "'type': 'tokens', 'code': 'rate_limit_exceeded'}}"
+        )
 
 
 class FakeResponse:
@@ -140,6 +155,46 @@ def main() -> None:
         raised = str(exc)
     check(f"does not retry non-retryable (calls={completions.calls})", completions.calls == 1)
     check("surfaces original error", "400" in raised)
+
+    print("\n=== daily quota (TPD) is not retryable ===")
+    check("TPD detected", _is_daily_quota_error(FakeDailyQuota()))
+    check("TPM not misread as daily", not _is_daily_quota_error(FakeRateLimit()))
+    check("json error not a daily quota", not _is_daily_quota_error(FakeJsonValidation()))
+
+    client, completions = scripted_client([FakeDailyQuota()])
+    raised = ""
+    raised_type = ""
+    try:
+        client.complete("sys", "user", json_mode=True)
+    except Exception as exc:
+        raised = str(exc)
+        raised_type = type(exc).__name__
+    check("daily quota makes exactly one call", completions.calls == 1, f"calls={completions.calls}")
+    check("raises the specific daily-limit type", raised_type == "LLMDailyLimitError", raised_type)
+    check("message states the quota numbers", "196,481 of 200,000" in raised, raised[:100])
+    check("message shows percentage used", "98%" in raised, raised[:120])
+    check("message shows remaining budget", "3,519 remaining" in raised, raised[:140])
+    check("message states the call size", "5,670 tokens" in raised, raised[:170])
+    check("message explains retrying is futile", "will not succeed on retry" in raised, raised[:220])
+    check("message parses the 15m29.232s hint", "15m29.232s" in raised, raised[-200:])
+    check("message links to billing", "console.groq.com/settings/billing" in raised)
+    check("does not claim the old retry count", "after 6 attempt(s)" not in raised)
+
+    client, completions = scripted_client([FakeRateLimit()] * 99)
+    tpm_ok = False
+    try:
+        client.complete("sys", "user", json_mode=True)
+    except Exception:
+        tpm_ok = True
+    check(
+        f"per-minute limit still retries to exhaustion (calls={completions.calls})",
+        completions.calls == client.max_retries + 1 and tpm_ok,
+        f"calls={completions.calls}",
+    )
+    check(
+        "per-minute limit is not reported as a daily quota",
+        "daily token quota" not in str(completions),
+    )
 
     print("\n=== json parsing ===")
     check("plain object", parse_json('{"a": 1}') == {"a": 1})

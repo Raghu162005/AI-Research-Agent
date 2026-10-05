@@ -223,7 +223,7 @@ and search layers are injected as fakes.
 
 ```bash
 cd backend
-python tests/test_llm.py      # 32  retry/backoff, attempt accounting, JSON fallback
+python tests/test_llm.py      # 47  retry/backoff, TPM vs TPD, JSON fallback
 python tests/test_agent.py    # 72  pipeline, citations, dedup, store recovery
 python tests/test_api.py      # 49  API, SSE, downloads, restart recovery
 ```
@@ -253,16 +253,26 @@ placeholders.
 degenerate output. `config.py:_resolve_temperature` now enforces this per model, so the
 failure cannot silently reappear.
 
-**3. Rate limits killed jobs outright.** The free tier allows 8,000 tokens/minute
-*in total*. With `MAX_CONCURRENT_JOBS=2` the app would happily accept a second job that
-could not possibly finish — one failed with
-`Limit 8000, Used 3036, Requested 5917`. Fixed properly rather than by hiding the error:
+**3. Rate limits killed jobs outright.** Two different limits were being conflated, and
+they need opposite handling:
+
+| Limit | Groq free tier | Recovers by | Correct handling |
+| ----- | -------------- | ----------- | ---------------- |
+| TPM — per **minute** | 8,000 | seconds | Retry with backoff |
+| TPD — per **day**   | 200,000 | hours | Fail immediately |
+
+The original code treated both as a generic `429` and retried. So:
 
 - concurrency defaults to `1`, so work is serialized
-- `LLMClient` classifies failures and retries only what is worth retrying (429, 5xx,
+- `LLMClient` classifies failures and retries only what is worth retrying (429 TPM, 5xx,
   timeouts), never a `400`
 - backoff is exponential with jitter, and **parses the provider's own
   `Please try again in 7.1475s` hint** to wait exactly as long as advised
+- **daily-quota exhaustion is detected and fails immediately.** Waiting a minute does not
+  un-spend a day's tokens, so retrying only delays an inevitable failure. It previously
+  burned six attempts and ~64 seconds to fail anyway. The raised error now names the
+  numbers: `196,481 of 200,000 tokens used today (98%), about 3,519 remaining. This call
+  needs 5,670 tokens`, plus the reset hint and a link to upgrade.
 - retried attempts are logged, not swallowed
 
 **4. Dashboard hung forever after a restart.** Job state is in-memory; the SQLite row
@@ -311,6 +321,11 @@ appeared instantly. The count is now the number of attempts genuinely made.
 
 - **Job state is per-process.** Running multiple workers would each have their own job
   registry. Fine locally; move to Redis or Celery before deploying at scale.
+- **The Groq free tier allows roughly six to eight full reports per day.** A run costs
+  ~25,000-30,000 tokens against a 200,000 token daily cap and an 8,000 token per-minute
+  cap. That is enough to develop against but not to demo continuously, so `MAX_SUBTOPICS`
+  is the main dial for stretching it. The daily cap resets on a rolling window rather than
+  at midnight, so there is no predictable time to wait for.
 - **Two processes, no containerization.** There is no Dockerfile or compose file yet.
 - **`npm audit` reports 5 high-severity advisories.** All of them are in the
   `eslint-config-next` devDependency chain (`braces` → `micromatch` → `fast-glob`) and do

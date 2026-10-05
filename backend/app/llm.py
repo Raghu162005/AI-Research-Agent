@@ -29,10 +29,26 @@ _JSON_VALIDATION_MARKERS = (
     "failed to generate json",
     "invalid json",
 )
+_DAILY_QUOTA_MARKERS = (
+    "tokens per day",
+    "tpd",
+    " per day",
+    "daily limit",
+    "requests per day",
+    "rpd",
+)
+_RESET_HINT = re.compile(r"try again in\s*((?:\d+h)?(?:\d+m)?[\d.]*s)", re.IGNORECASE)
+_USED = re.compile(r"Used\s+([\d,]+)")
+_LIMIT = re.compile(r"Limit\s+([\d,]+)")
+_REQUESTED = re.compile(r"Requested\s+([\d,]+)")
 
 
 class LLMError(RuntimeError):
     pass
+
+
+class LLMDailyLimitError(LLMError):
+    """The account's daily token quota is spent, so retrying cannot succeed."""
 
 
 class LLMJSONError(LLMError):
@@ -58,6 +74,48 @@ def _is_json_validation_error(exc: Exception) -> bool:
     """
     message = f"{type(exc).__name__}: {exc}".lower()
     return any(marker in message for marker in _JSON_VALIDATION_MARKERS)
+
+
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """True for per-day quota exhaustion, which is not worth retrying.
+
+    A per-minute limit resets in seconds and retrying works. A daily limit does
+    not: waiting a minute leaves the day's quota just as spent, so retrying only
+    delays an inevitable failure.
+    """
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in message for marker in _DAILY_QUOTA_MARKERS)
+
+
+def _daily_limit_message(exc: Exception) -> str:
+    text = str(exc)
+    used = _USED.search(text)
+    limit = _LIMIT.search(text)
+    requested = _REQUESTED.search(text)
+    hint = _RESET_HINT.search(text)
+
+    parts = ["Groq daily token quota is exhausted"]
+    if used and limit:
+        used_value = int(used.group(1).replace(",", ""))
+        limit_value = int(limit.group(1).replace(",", ""))
+        remaining = max(limit_value - used_value, 0)
+        parts[0] += (
+            f": {used_value:,} of {limit_value:,} tokens used today "
+            f"({used_value / limit_value:.0%}), about {remaining:,} remaining."
+        )
+    if requested:
+        parts.append(f"This call needs {int(requested.group(1).replace(',', '')):,} tokens.")
+    parts.append(
+        "Daily quotas do not recover by waiting a few minutes, so this will not "
+        "succeed on retry."
+    )
+    if hint:
+        parts.append(
+            f"The provider suggests waiting {hint.group(1)}, but if the quota is "
+            "still spent then, either wait for the daily window to roll over or "
+            "upgrade at https://console.groq.com/settings/billing"
+        )
+    return " ".join(parts)
 
 
 def _retry_delay(exc: Exception, attempt: int, base: float, maximum: float) -> float:
@@ -151,6 +209,8 @@ class LLMClient:
                 return response.choices[0].message.content
             except Exception as exc:
                 last_error = exc
+                if _is_daily_quota_error(exc):
+                    raise LLMDailyLimitError(_daily_limit_message(exc)) from exc
                 if attempt == max_attempts - 1 or not _is_retryable(exc):
                     break
                 delay = _retry_delay(
