@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -66,3 +66,32 @@ class ResearchResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     llm_model: str
+
+
+class IeeeBlock(BaseModel):
+    kind: Literal["paragraph", "subheading", "list"]
+    text: str | None = None
+    items: list[str] = Field(default_factory=list)
+
+
+class IeeeSection(BaseModel):
+    heading: str
+    blocks: list[IeeeBlock]
+
+
+class IeeeReference(BaseModel):
+    number: int
+    text: str
+    url: str | None = None
+
+
+class IeeePaperResponse(BaseModel):
+    title: str
+    authors: str
+    abstract: str
+    keywords: list[str]
+    sections: list[IeeeSection]
+    references: list[IeeeReference]
+    markdown: str
+    source_count: int
+    cited_count: int

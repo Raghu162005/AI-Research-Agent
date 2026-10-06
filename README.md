@@ -2,7 +2,8 @@
 
 An autonomous research agent that takes a topic, breaks it into subtopics, searches the
 web, reads what it finds, cross-checks the evidence, and writes a cited report you can
-export as Markdown or PDF.
+export as Markdown or PDF. Finished reports can be restructured into an **IEEE-style
+research paper** with a two-column PDF export.
 
 Runs asynchronously with live progress streaming, so the UI shows the agent's reasoning
 as it works instead of a blank spinner for three minutes.
@@ -25,6 +26,13 @@ Topic  ->  Plan  ->  Search  ->  Analyze  ->  Write  ->  Validated report
   reference the agent cannot back up
 - **Streams progress** over Server-Sent Events, persisting reports to SQLite
 - **Exports** Markdown and PDF with clickable, resolvable citation links
+- **Generates an IEEE-style paper** from any completed report — abstract, index terms,
+  six numbered sections (Introduction through Conclusion) and a reference list built
+  only from sources the agent actually retrieved, never invented. Exported as Markdown
+  or a two-column PDF. Called "IEEE-style" deliberately: the layout follows IEEE
+  conventions (centred Roman-numeral headings, lettered subheadings, "Abstract—"
+  run-in, hanging-indent references) but is not validated against the official IEEE
+  submission template.
 
 Example output on a real run: 20 sources retrieved, 17 cited (85% coverage), 4 sections,
 20 findings, 2 conflicts and 15 evidence gaps in ~175 seconds.
@@ -95,7 +103,7 @@ requests outright.
 | Search    | Tavily (`tavily-python`)                                      |
 | API       | FastAPI + Uvicorn, Pydantic v2 schemas                        |
 | Storage   | SQLite (stdlib `sqlite3`, no ORM)                             |
-| PDF       | ReportLab                                                      |
+| PDF       | ReportLab (report export + IEEE-style two-column paper)         |
 | Frontend  | Next.js 16 (App Router), React 19, Tailwind 4                 |
 | Markdown  | `react-markdown` + `remark-gfm`                               |
 | Testing   | Plain assertion scripts (`stdlib` only, no test framework)    |
@@ -194,6 +202,9 @@ All backend settings are environment variables read from `backend/.env`.
 | `GET`    | `/research/{id}/events`       | SSE progress stream until a terminal event     |
 | `GET`    | `/research/{id}/report.md`    | Download Markdown                              |
 | `GET`    | `/research/{id}/report.pdf`   | Download PDF                                   |
+| `GET`    | `/research/{id}/paper`        | Generate IEEE-style paper (JSON)               |
+| `GET`    | `/research/{id}/paper.md`     | Download the paper as Markdown                 |
+| `GET`    | `/research/{id}/paper.pdf`    | Download the paper, two-column PDF             |
 | `GET`    | `/reports`                    | History, newest first (`?limit=`)              |
 | `DELETE` | `/research/{id}`              | Delete a report                                |
 

@@ -80,6 +80,37 @@ export interface ReportSummary {
   duration_seconds: number | null;
 }
 
+export type IeeeBlockKind = "paragraph" | "subheading" | "list";
+
+export interface IeeeBlock {
+  kind: IeeeBlockKind;
+  text?: string | null;
+  items?: string[];
+}
+
+export interface IeeeSection {
+  heading: string;
+  blocks: IeeeBlock[];
+}
+
+export interface IeeeReference {
+  number: number;
+  text: string;
+  url: string | null;
+}
+
+export interface IeeePaper {
+  title: string;
+  authors: string;
+  abstract: string;
+  keywords: string[];
+  sections: IeeeSection[];
+  references: IeeeReference[];
+  markdown: string;
+  source_count: number;
+  cited_count: number;
+}
+
 export const STAGE_LABELS: Record<string, string> = {
   plan: "Planning",
   search: "Searching",

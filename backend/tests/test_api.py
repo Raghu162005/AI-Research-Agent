@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.agent import (
     Subtopic,
 )
 from app.config import get_settings
+from app.ieee import build_paper
 from app.tools.web_search import Source
 
 TOPIC = "Impact of Agentic AI on Software Development"
@@ -187,6 +189,92 @@ def run_suite():
     check("pdf magic bytes", pdf.content[:5] == b"%PDF-")
     check("pdf non-trivial size", len(pdf.content) > 2000, str(len(pdf.content)))
 
+    print("\n=== IEEE paper ===")
+    check(
+        "unknown paper 404s",
+        client.get("/research/does-not-exist/paper").status_code == 404,
+    )
+
+    paper_resp = client.get(f"/research/{report_id}/paper")
+    check("paper 200", paper_resp.status_code == 200, str(paper_resp.status_code))
+    paper = paper_resp.json()
+    check("paper title", paper["title"] == TOPIC, paper.get("title"))
+    check("paper authors", paper["authors"] == "AI Research Agent", paper.get("authors"))
+    check(
+        "paper abstract from executive summary",
+        "Agentic tooling" in paper["abstract"],
+        paper["abstract"],
+    )
+    check("paper keywords", len(paper["keywords"]) >= 3, str(paper["keywords"]))
+    headings = [section["heading"] for section in paper["sections"]]
+    check(
+        "paper sections in order",
+        headings
+        == [
+            "I. INTRODUCTION",
+            "II. RELATED WORK",
+            "III. METHODOLOGY",
+            "IV. RESULTS AND ANALYSIS",
+            "V. DISCUSSION",
+            "VI. CONCLUSION",
+        ],
+        str(headings),
+    )
+    check(
+        "every section has content",
+        all(section["blocks"] for section in paper["sections"]),
+        str([len(section["blocks"]) for section in paper["sections"]]),
+    )
+    check("one reference", len(paper["references"]) == 1, str(paper["references"]))
+    check(
+        "reference is a retrieved source",
+        paper["references"][0]["url"] == "https://example.com/a",
+        str(paper["references"][0]),
+    )
+    check(
+        "reference uses retrieved metadata only",
+        paper["references"][0]["text"].startswith('"Study A," example.com.'),
+        paper["references"][0]["text"],
+    )
+    check("cited_count matches references", paper["cited_count"] == 1)
+    check("source_count matches record", paper["source_count"] == 1)
+    dump = json.dumps(paper)
+    check("finding citation kept", "Gains are 10-30%. Two studies. [1]" in dump, dump[:400])
+    related = next(
+        section
+        for section in paper["sections"]
+        if section["heading"] == "II. RELATED WORK"
+    )
+    related_text = " ".join(
+        block.get("text") or "" for block in related["blocks"] if block["kind"] == "paragraph"
+    )
+    check(
+        "related work cites source",
+        '"Study A" [1] (example.com)' in related_text,
+        related_text,
+    )
+
+    tampered = json.loads(json.dumps(store.get(report_id)))
+    tampered["sections"][0]["findings"][0]["source_indexes"] = [1, 99]
+    rebuilt = build_paper(tampered)
+    rebuilt_dump = json.dumps(rebuilt)
+    check("invalid citation stripped", "[99]" not in rebuilt_dump, rebuilt_dump[:400])
+    check("valid citation kept after strip", "[1]" in rebuilt_dump)
+
+    pmd = client.get(f"/research/{report_id}/paper.md")
+    check("paper md 200", pmd.status_code == 200, str(pmd.status_code))
+    check("paper md content-type", "text/markdown" in pmd.headers["content-type"])
+    check("paper md disposition", "ieee" in pmd.headers["content-disposition"])
+    check("paper md section heading", "## I. INTRODUCTION" in pmd.text)
+    check("paper md references", '[1] "Study A,"' in pmd.text, pmd.text[-400:])
+
+    ppdf = client.get(f"/research/{report_id}/paper.pdf")
+    check("paper pdf 200", ppdf.status_code == 200, str(ppdf.status_code))
+    check("paper pdf content-type", ppdf.headers["content-type"] == "application/pdf")
+    check("paper pdf magic bytes", ppdf.content[:5] == b"%PDF-")
+    check("paper pdf non-trivial size", len(ppdf.content) > 3000, str(len(ppdf.content)))
+    check("paper pdf disposition", "ieee" in ppdf.headers["content-disposition"])
+
     print("\n=== history + delete ===")
     listing = client.get("/reports").json()["reports"]
     check("history lists report", any(r["id"] == report_id for r in listing))
@@ -209,6 +297,10 @@ def run_suite():
     check(
         "download blocked while failed",
         client.get(f"/research/{failed_id}/report.pdf").status_code == 409,
+    )
+    check(
+        "paper blocked while failed",
+        client.get(f"/research/{failed_id}/paper").status_code == 409,
     )
     with client.stream("GET", f"/research/{failed_id}/events") as stream:
         fail_body = "".join(chunk for chunk in stream.iter_text())

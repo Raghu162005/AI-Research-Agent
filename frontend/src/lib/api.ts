@@ -1,4 +1,4 @@
-import type { Report, ReportSummary } from "./types";
+import type { IeeePaper, Report, ReportSummary } from "./types";
 
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
@@ -45,8 +45,14 @@ export function deleteReport(id: string) {
   return request<{ deleted: string }>(`/research/${id}`, { method: "DELETE" });
 }
 
+export function fetchPaper(id: string) {
+  return request<IeeePaper>(`/research/${id}/paper`);
+}
+
 export const downloadUrls = {
   markdown: (id: string) => `${API_BASE}/research/${id}/report.md`,
   pdf: (id: string) => `${API_BASE}/research/${id}/report.pdf`,
   events: (id: string) => `${API_BASE}/research/${id}/events`,
+  paperMarkdown: (id: string) => `${API_BASE}/research/${id}/paper.md`,
+  paperPdf: (id: string) => `${API_BASE}/research/${id}/paper.pdf`,
 };

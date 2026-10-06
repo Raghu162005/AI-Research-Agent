@@ -5,13 +5,14 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { HistoryList } from "@/components/history-list";
+import { IeeePaperView } from "@/components/ieee-paper";
 import { ProgressTimeline } from "@/components/progress-timeline";
 import { RawMarkdown, ReportMarkdown } from "@/components/report-markdown";
 import { SourcesPanel } from "@/components/sources-panel";
-import { API_BASE, downloadUrls, fetchReport } from "@/lib/api";
-import type { ProgressEvent, Report } from "@/lib/types";
+import { API_BASE, downloadUrls, fetchPaper, fetchReport } from "@/lib/api";
+import type { IeeePaper, ProgressEvent, Report } from "@/lib/types";
 
-type Tab = "report" | "markdown" | "analysis";
+type Tab = "report" | "markdown" | "analysis" | "paper";
 
 export default function ResearchPage() {
   const params = useParams<{ id: string }>();
@@ -22,7 +23,24 @@ export default function ResearchPage() {
   const [events, setEvents] = useState<ProgressEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("report");
+  const [paper, setPaper] = useState<IeeePaper | null>(null);
+  const [paperLoading, setPaperLoading] = useState(false);
+  const [paperError, setPaperError] = useState<string | null>(null);
   const sourceRef = useRef<EventSource | null>(null);
+
+  const generatePaper = useCallback(async () => {
+    setPaperLoading(true);
+    setPaperError(null);
+    try {
+      setPaper(await fetchPaper(reportId));
+    } catch (err) {
+      setPaperError(
+        err instanceof Error ? err.message : "Could not generate the IEEE paper."
+      );
+    } finally {
+      setPaperLoading(false);
+    }
+  }, [reportId]);
 
   const loadReport = useCallback(async () => {
     try {
@@ -108,6 +126,7 @@ export default function ResearchPage() {
     { key: "report", label: "Report" },
     { key: "analysis", label: "Evidence" },
     ...(report.markdown ? ([{ key: "markdown", label: "Markdown" }] as const) : []),
+    { key: "paper", label: "IEEE Paper" },
   ];
 
   return (
@@ -212,6 +231,72 @@ export default function ResearchPage() {
               )}
               {tab === "markdown" && <RawMarkdown markdown={report.markdown} />}
               {tab === "analysis" && <EvidenceView report={report} />}
+              {tab === "paper" && (
+                <div>
+                  {paperLoading ? (
+                    <div className="animate-pulse-soft space-y-3">
+                      <div className="mx-auto h-6 w-2/3 rounded bg-surface-raised" />
+                      <div className="h-24 w-full rounded-xl bg-surface-raised/60" />
+                      <div className="h-40 w-full rounded-xl bg-surface-raised/40" />
+                      <p className="text-center font-mono text-[11px] text-muted">
+                        Generating IEEE-style paper...
+                      </p>
+                    </div>
+                  ) : paper ? (
+                    <div>
+                      <div className="mb-4 flex flex-wrap items-center justify-end gap-2">
+                        <span className="mr-auto font-mono text-[10px] tracking-wide text-muted uppercase">
+                          {paper.cited_count} references from {paper.source_count} retrieved
+                          sources
+                        </span>
+                        <button
+                          type="button"
+                          onClick={generatePaper}
+                          className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs font-medium text-muted transition hover:border-accent/50 hover:text-foreground"
+                        >
+                          Regenerate
+                        </button>
+                        <a
+                          href={downloadUrls.paperMarkdown(reportId)}
+                          className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs font-medium text-muted transition hover:border-accent/50 hover:text-foreground"
+                        >
+                          .md
+                        </a>
+                        <a
+                          href={downloadUrls.paperPdf(reportId)}
+                          className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-[#05070f] transition hover:bg-[#6ba0ff]"
+                        >
+                          .pdf
+                        </a>
+                      </div>
+                      {paperError && (
+                        <p className="mb-3 rounded-lg border border-danger/35 bg-danger/10 px-3 py-2 text-xs text-danger">
+                          {paperError}
+                        </p>
+                      )}
+                      <IeeePaperView paper={paper} sources={report.sources} />
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-border-subtle bg-[#0a1020] p-6 text-center">
+                      <p className="text-sm leading-relaxed text-muted">
+                        Restructure this completed report into an IEEE-style paper: abstract,
+                        index terms, six numbered sections, and references drawn only from
+                        sources the agent actually retrieved.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={generatePaper}
+                        className="mt-4 rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-[#05070f] transition hover:bg-[#6ba0ff]"
+                      >
+                        Generate IEEE Research Paper
+                      </button>
+                      {paperError && (
+                        <p className="mt-3 text-xs text-danger">{paperError}</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
           )}
         </div>

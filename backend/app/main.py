@@ -10,10 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
 from app.config import ConfigError, get_settings
+from app.ieee import build_paper, render_ieee_pdf
 from app.jobs import get_job_manager
 from app.pdf import render_pdf
 from app.schemas import (
     HealthResponse,
+    IeeePaperResponse,
     ReportList,
     ReportSummary,
     ResearchCreated,
@@ -74,6 +76,9 @@ def home():
             "GET /research/{id}/events",
             "GET /research/{id}/report.md",
             "GET /research/{id}/report.pdf",
+            "GET /research/{id}/paper",
+            "GET /research/{id}/paper.md",
+            "GET /research/{id}/paper.pdf",
             "GET /reports",
         ],
     }
@@ -215,6 +220,42 @@ def download_pdf(report_id: str) -> Response:
     }
     pdf_bytes = render_pdf(record["markdown"], sources)
     filename = f"{_slug(record['topic'])}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/research/{report_id}/paper", response_model=IeeePaperResponse)
+def get_ieee_paper(report_id: str) -> IeeePaperResponse:
+    record = _completed_report(report_id)
+    return IeeePaperResponse(**build_paper(record))
+
+
+@app.get("/research/{report_id}/paper.md")
+def download_paper_markdown(report_id: str) -> Response:
+    record = _completed_report(report_id)
+    paper = build_paper(record)
+    filename = f"{_slug(record['topic'])}-ieee.md"
+    return Response(
+        content=paper["markdown"],
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/research/{report_id}/paper.pdf")
+def download_paper_pdf(report_id: str) -> Response:
+    record = _completed_report(report_id)
+    paper = build_paper(record)
+    sources = {
+        int(source["index"]): source["url"]
+        for source in record.get("sources") or []
+        if source.get("index") and source.get("url")
+    }
+    pdf_bytes = render_ieee_pdf(paper, sources)
+    filename = f"{_slug(record['topic'])}-ieee.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
